@@ -9835,10 +9835,344 @@ def render_daily_briefing(symbols: list):
     st.markdown('</div>', unsafe_allow_html=True)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 🧠 AI 總結：自動彙整所有分析結果 → 組成總結 Prompt → 一鍵 / 自動 AI 總結
+# 彙整來源：多週期技術指標、月/週/日關鍵位、期權、社群情緒、大盤環境、
+#           警示記錄、各週期 AI 信號、系統建議交易、進場追蹤
+# ══════════════════════════════════════════════════════════════════════════════
+_SUMMARY_FRAMES = ["5m", "15m", "30m", "1d", "1wk"]
+
+
+def _sum_clean(txt: str, n: int = 110) -> str:
+    txt = re.sub(r"<[^>]+>", "", str(txt))
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return txt[:n]
+
+
+def _sum_tech_snapshot(symbol: str, interval: str, prepost: bool = False) -> dict:
+    """單一週期技術快照（使用已快取的 fetch_data，不額外增加請求）"""
+    try:
+        df = fetch_data(symbol, interval, prepost=prepost)
+        if df is None or df.empty or len(df) < 30:
+            return {}
+        close = df["Close"]
+        last = float(close.iloc[-1])
+        emas = {n: float(calc_ema(close, n).iloc[-1])
+                for n, _ in EMA_CONFIGS if n <= len(df)}
+        dif, dea, hist = calc_macd(close)
+        rsi = calc_rsi(close).iloc[-1]
+        try:
+            atr = float(calc_atr(df).iloc[-1])
+        except Exception:
+            atr = float((df["High"] - df["Low"]).tail(14).mean())
+        hs, ls = calc_pivot(df, interval)
+        res = sorted({round(p, 2) for _, p in hs if p > last * 1.001})[:2]
+        sup = sorted({round(p, 2) for _, p in ls if p < last * 0.999}, reverse=True)[:2]
+        vol_ma5 = float(df["Volume"].rolling(5).mean().iloc[-1])
+        vol_ratio = float(df["Volume"].iloc[-1]) / vol_ma5 if vol_ma5 > 0 else 1.0
+        ret5 = (last / float(close.iloc[-6]) - 1) * 100 if len(close) > 6 else 0.0
+        try:
+            ts = df.index[-1].strftime("%m/%d %H:%M")
+        except Exception:
+            ts = ""
+        return {
+            "label": INTERVAL_LABELS.get(interval, interval), "last": last, "ts": ts,
+            "trend": detect_trend(df), "macd": get_macd_signal(df),
+            "ema_sig": get_ema_signal(df),
+            "above": [n for n, v in emas.items() if last > v],
+            "below": [n for n, v in emas.items() if last <= v],
+            "ema20": emas.get(20), "ema60": emas.get(60),
+            "rsi": None if pd.isna(rsi) else float(rsi),
+            "atr": atr, "res": res, "sup": sup,
+            "vol_ratio": vol_ratio, "ret5": ret5,
+            "hist": float(hist.iloc[-1]),
+        }
+    except Exception:
+        return {}
+
+
+def build_master_summary_prompt(symbol: str, frames=None, prepost: bool = False):
+    """
+    把所有分析結果組成一份完整的「總結 Prompt」。
+    回傳 (prompt 文字, fingerprint)；fingerprint 只含方向性結論，
+    用來判斷「分析結論是否真的改變」，避免價格跳動就重複呼叫 AI。
+    """
+    frames = frames or _SUMMARY_FRAMES
+    fp = {}
+    L = []
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    L.append(f"# {symbol} 全面分析數據包（生成時間 {now_str}）\n")
+
+    # ── 1. 大盤環境 ───────────────────────────────────────────────────────
+    try:
+        mkt = fetch_market_data()
+        vix_hist = fetch_vix_history()
+        sent = calc_sentiment_score(mkt, vix_hist)
+        L.append("## 1. 大盤環境")
+        L.append(f"- 綜合情緒分數：{sent['score']}/100（{sent['label']}）")
+        for key, m in mkt.items():
+            L.append(f"- {m['name']}（{m['ticker']}）：{m['last']:.2f}（{m['pct']:+.2f}%）")
+        fp["mkt"] = sent["label"]
+        L.append("")
+    except Exception:
+        L.append("## 1. 大盤環境\n- 數據未載入\n")
+
+    # ── 2. 多週期技術指標 ─────────────────────────────────────────────────
+    L.append("## 2. 多週期技術指標")
+    L.append("| 週期 | 現價 | 均線排列 | MACD | RSI | ATR | 壓力 | 支撐 | 量比 | 近5根 |")
+    L.append("|---|---|---|---|---|---|---|---|---|---|")
+    last_px = None
+    tech_cnt = 0
+    for itv in frames:
+        s = _sum_tech_snapshot(symbol, itv, prepost)
+        if not s:
+            continue
+        tech_cnt += 1
+        if itv == "1d" or last_px is None:
+            last_px = s["last"]
+        rsi = f"{s['rsi']:.0f}" if s["rsi"] is not None else "—"
+        res = "/".join(f"${x}" for x in s["res"]) or "—"
+        sup = "/".join(f"${x}" for x in s["sup"]) or "—"
+        L.append(f"| {s['label']} | ${s['last']:.2f} | {s['trend']} | {s['macd']} | {rsi} | "
+                 f"${s['atr']:.2f} | {res} | {sup} | {s['vol_ratio']:.1f}x | {s['ret5']:+.2f}% |")
+        fp[f"tech_{itv}"] = (s["trend"], "多" if ("↑" in s["macd"] or "金叉" in s["macd"]) else "空")
+    if not tech_cnt:
+        L.append("| 數據未載入 | | | | | | | | | |")
+    L.append("")
+
+    # ── 3. 月/週/日關鍵位 ─────────────────────────────────────────────────
+    try:
+        kl = fetch_mtf_keylevels(symbol)
+        L.append("## 3. 月K / 週K / 日K 關鍵位")
+        for fname, f in (kl.get("frames") or {}).items():
+            if not f or "error" in f:
+                continue
+            res3 = "、".join(f"${r[0]}" for r in f["resistances"][:3]) or "—"
+            sup3 = "、".join(f"${r[0]}" for r in f["supports"][:3]) or "—"
+            L.append(f"- {fname}：{f['dir_label']}｜EMA20 ${f['ema20']} / EMA60 ${f['ema60']}｜"
+                     f"最近壓力 ${f['nearest_res']}（{f['dist_res_pct']}%）｜"
+                     f"最近支撐 ${f['nearest_sup']}（-{f['dist_sup_pct']}%）｜"
+                     f"上方壓力：{res3}｜下方支撐：{sup3}")
+            fp[f"kl_{fname}"] = f["direction"]
+        L.append("")
+    except Exception:
+        pass
+
+    # ── 4. 期權 ───────────────────────────────────────────────────────────
+    try:
+        op = fetch_options_data(symbol)
+        L.append("## 4. 期權數據")
+        if op.get("error"):
+            L.append("- 期權數據暫不可用\n")
+        else:
+            pcv = op.get("pc_vol"); pco = op.get("pc_oi")
+            L.append(f"- P/C 成交量 {pcv:.2f}｜P/C 未平倉 {pco:.2f}" if pcv is not None and pco is not None
+                     else "- P/C 數據不足")
+            if op.get("atm_iv") is not None:
+                L.append(f"- ATM IV {op['atm_iv']:.1f}%｜IV Skew {op['iv_skew'] if op.get('iv_skew') is not None else '—'}%")
+            if op.get("max_pain"):
+                L.append(f"- 最大痛點 ${op['max_pain']:.0f}")
+            L.append(f"- 權利金：Call ${op['tot_c_prem']/1e6:.1f}M / Put ${op['tot_p_prem']/1e6:.1f}M")
+            L.append(f"- 期權綜合訊號：{op.get('signal', 'neutral')}")
+            for r in op.get("signal_reasons", [])[:4]:
+                L.append(f"  - {r}")
+            for t in op.get("top_trades", [])[:3]:
+                L.append(f"- 大額成交：{t['type']} ${t['strike']:.0f} 到期{t['expiry']}，"
+                         f"權利金 ${t['premium']/1e6:.2f}M，量 {t['volume']}")
+            fp["opt"] = op.get("signal", "neutral")
+            L.append("")
+    except Exception:
+        pass
+
+    # ── 5. 社群情緒 ───────────────────────────────────────────────────────
+    try:
+        st_d = fetch_stocktwits(symbol)
+        rd_d = fetch_reddit_sentiment(symbol)
+        L.append("## 5. 社群 / 新聞情緒")
+        L.append(f"- 新聞+StockTwits：偏多 {st_d['bull_pct']}%（樣本 {st_d['total']}）")
+        L.append(f"- Reddit：偏多 {rd_d['bull_pct']}%（樣本 {rd_d['total']}）")
+        for m in st_d.get("messages", [])[:3]:
+            L.append(f"  - [{m.get('sentiment','')}] {_sum_clean(m.get('body',''), 90)}")
+        fp["soc"] = (st_d["bull_pct"] // 20, rd_d["bull_pct"] // 20)
+        L.append("")
+    except Exception:
+        pass
+
+    # ── 6. 警示記錄 ───────────────────────────────────────────────────────
+    alerts = [a for a in st.session_state.get("alert_log", []) if a.get("股票") == symbol]
+    if alerts:
+        nb = sum(1 for a in alerts if a["類型"] == "bull")
+        ne = sum(1 for a in alerts if a["類型"] == "bear")
+        L.append(f"## 6. 警示信號（累計 多頭 {nb} / 空頭 {ne} / 其他 {len(alerts)-nb-ne}）")
+        for a in alerts[:12]:
+            L.append(f"- {a['時間']} [{a['週期']}] {a['類型']}：{_sum_clean(a['訊息'])}")
+        fp["alerts"] = len(alerts)
+        L.append("")
+
+    # ── 7. 各週期 AI 信號分析 ─────────────────────────────────────────────
+    ai_rows = []
+    for k, v in st.session_state.items():
+        if isinstance(k, str) and k.startswith(f"ai_manual_{symbol}_") and isinstance(v, dict) and "error" not in v:
+            ai_rows.append(v)
+    for v in st.session_state.get("ai_signal_results", []):
+        if v.get("_symbol") == symbol and "error" not in v:
+            ai_rows.append(v)
+    if ai_rows:
+        L.append("## 7. 各週期 AI 信號分析結果")
+        for v in ai_rows[:6]:
+            L.append(f"- [{v.get('_period','')}] {v.get('verdict','觀望')}（信心 {v.get('confidence','—')}%）"
+                     f"｜進場 ${v.get('entry_price',0)}｜止盈 ${v.get('take_profit_1',0)}/${v.get('take_profit_2',0)}"
+                     f"｜止損 ${v.get('stop_loss',0)}｜{_sum_clean(v.get('reasoning',''), 120)}")
+        fp["ai"] = tuple(sorted(str(v.get("verdict")) for v in ai_rows[:6]))
+        L.append("")
+
+    # ── 8. 系統建議交易 / 進場追蹤 ────────────────────────────────────────
+    sugs = [s for s in st.session_state.get("trade_suggestions", [])
+            if s.get("股票") == symbol and s.get("狀態") == "待確認"]
+    trks = [t for t in st.session_state.get("entry_trackers", [])
+            if t.get("symbol") == symbol and t.get("status") == "追蹤中"]
+    if sugs or trks:
+        L.append("## 8. 系統建議交易 / 進場追蹤")
+        for s in sugs[:3]:
+            L.append(f"- 建議 {s['方向']} [{s['週期']}]：進場 ${s['進場']:.2f}｜止損 ${s['止損']:.2f}｜"
+                     f"止盈 ${s['止盈1']:.2f}/${s['止盈2']:.2f}｜回測勝率 {s['WR']:.0f}%（n={s['樣本數']}）")
+        for t in trks[:3]:
+            L.append(f"- 追蹤中 {t['direction']}：來源「{t['trigger_signal']}」@ ${t['trigger_price']:.2f}｜"
+                     f"止損 ${t['sl']}｜止盈 ${t['tp1']}/${t['tp2']}")
+        L.append("")
+
+    # ── 9. 給 AI 的任務指令 ───────────────────────────────────────────────
+    ref = f"${last_px:.2f}" if last_px else "現價"
+    L.append("---")
+    L.append(f"""# 任務
+你是資深美股日內／波段交易分析師。請根據以上全部數據，為 {symbol}（參考價 {ref}）做出**一份整合總結**，使用繁體中文。
+
+## 輸出格式（嚴格遵守）
+1. **一句話結論**：做多 / 做空 / 觀望，加上信心度 0-100%，不要模稜兩可。
+2. **多空共識表**（Markdown 表格）：列出 大盤、短線(5m/15m/30m)、日K、週/月K、期權、社群、警示 各自偏多/偏空/中性，最後一行給出多空票數。
+3. **操作計劃表**（Markdown 表格）：進場區間、止損、止盈①、止盈②、盈虧比，全部要有具體美元數字，價位必須來自上方數據的支撐/壓力/ATR，不可憑空捏造。
+4. **三個最關鍵的理由**：每個理由要引用上方具體數字。
+5. **矛盾與風險**：指出數據之間互相衝突的地方（例如短線多頭但週K壓力在上方），以及什麼情況下這個計劃失效（給出失效價位）。
+6. **下一步觀察**：未來 1-2 小時最該盯的價位或事件。
+
+## 規則
+- 只使用上方提供的數據，數據缺失就明說「無數據」，不要編造。
+- 直接給方向，不要用「可能」「或許」之類的含糊用語堆砌；不確定就降低信心度。
+- 總字數控制在 450 字以內（表格不計）。
+- 本內容僅為技術分析參考，不構成投資建議。""")
+
+    return "\n".join(L), fp
+
+
+def call_groq_summary(prompt: str) -> dict:
+    """呼叫 Groq 產生純文字（Markdown）總結，不使用 JSON 模式"""
+    api_key = get_groq_key()
+    if not api_key:
+        return {"error": "NO_KEY"}
+    try:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}",
+                     "Content-Type": "application/json"},
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [
+                    {"role": "system",
+                     "content": "你是專業美股交易分析師。永遠使用繁體中文，結論果斷、數字具體，"
+                                "只引用使用者提供的數據，輸出 Markdown。"},
+                    {"role": "user", "content": prompt},
+                ],
+                "max_tokens": 1800,
+                "temperature": 0.3,
+            },
+            timeout=45,
+        )
+        if resp.status_code == 401:
+            return {"error": "Groq API Key 無效，請重新輸入"}
+        if resp.status_code == 429:
+            return {"error": "請求頻率限制，請稍後再試"}
+        if resp.status_code != 200:
+            return {"error": f"Groq 錯誤 {resp.status_code}: {resp.text[:150]}"}
+        return {"text": resp.json()["choices"][0]["message"]["content"].strip()}
+    except requests.exceptions.Timeout:
+        return {"error": "請求超時（45秒），請稍後再試"}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def render_master_summary_panel(symbol: str, prepost: bool = False):
+    """🧠 AI 總結面板：自動彙整 → 自動（或手動）AI 總結 → 可複製完整 Prompt"""
+    st.markdown("---")
+    st.markdown(
+        '<div style="font-size:1.15rem;font-weight:800;color:#ffd166;margin:4px 0 8px 0;">'
+        '🧠 AI 全面總結（彙整本頁所有分析結果）</div>',
+        unsafe_allow_html=True)
+
+    k_txt, k_ts, k_fp = (f"sum_text_{symbol}", f"sum_ts_{symbol}", f"sum_fp_{symbol}")
+    has_key = bool(get_groq_key())
+
+    c1, c2, c3 = st.columns([2, 2, 1])
+    with c1:
+        auto_on = st.toggle("數據結論改變時自動總結", value=has_key,
+                            key=f"sum_auto_{symbol}", disabled=not has_key)
+    with c2:
+        cooldown = st.slider("最短間隔（分鐘）", 1, 30, 5, key=f"sum_cd_{symbol}",
+                             disabled=not (has_key and auto_on))
+    with c3:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        force = st.button("🔄 立即總結", key=f"sum_btn_{symbol}", use_container_width=True)
+
+    with st.spinner("彙整所有分析結果中..."):
+        prompt, fp = build_master_summary_prompt(symbol, prepost=prepost)
+
+    now = time.time()
+    last_ts = st.session_state.get(k_ts, 0)
+    fp_changed = st.session_state.get(k_fp) != fp
+    due = (now - last_ts) >= cooldown * 60
+    need_run = has_key and (force or k_txt not in st.session_state
+                            or (auto_on and fp_changed and due))
+
+    if need_run:
+        with st.spinner("🤖 AI 總結中..."):
+            res = call_groq_summary(prompt)
+        if "text" in res:
+            st.session_state[k_txt] = res["text"]
+            st.session_state[k_ts] = now
+            st.session_state[k_fp] = fp
+            st.session_state.pop(f"sum_err_{symbol}", None)
+        else:
+            st.session_state[f"sum_err_{symbol}"] = res["error"]
+            st.session_state[k_ts] = now  # 失敗也計入間隔，避免連續重試
+
+    if not has_key:
+        st.info("尚未設定 Groq API Key，無法自動總結。可先複製下方完整 Prompt，貼到任何 AI（Claude / ChatGPT / Gemini）使用。"
+                "Key 可在任一週期的「🤖 AI 分析」區塊輸入，或寫入 secrets.toml。")
+    err = st.session_state.get(f"sum_err_{symbol}")
+    if err and err != "NO_KEY":
+        st.warning(f"⚠️ {err}")
+
+    if k_txt in st.session_state:
+        ts_str = datetime.fromtimestamp(st.session_state[k_ts]).strftime("%H:%M:%S") \
+            if st.session_state.get(k_ts) else ""
+        st.markdown(
+            f'<div style="font-size:0.72rem;color:#556688;margin-bottom:4px;">'
+            f'最後總結：{ts_str}（Groq · LLaMA 3.3 70B）</div>', unsafe_allow_html=True)
+        st.markdown(st.session_state[k_txt])
+        st.caption("⚠️ AI 自動生成，僅供技術參考，不構成投資建議")
+
+    with st.expander("📋 完整總結 Prompt（可複製到其他 AI）", expanded=False):
+        st.code(prompt, language="markdown")
+        st.download_button("📥 下載 Prompt (.txt)", prompt,
+                           file_name=f"{symbol}_summary_prompt.txt",
+                           key=f"sum_dl_{symbol}")
+
+
+
 def render_single(symbol, interval, show_alerts, max_bars=90,
                   show_pre=False, show_post=False, show_night=False,
                   show_ai=False, show_market=False, show_social=False,
-                  show_options=False, show_mtf_keylevels=False):
+                  show_options=False, show_mtf_keylevels=False,
+                  show_summary=False):
     label, _ = INTERVAL_MAP[interval]
     _prepost = show_pre or show_post or show_night
     with st.spinner(f"載入 {symbol} {label} 數據中..."):
@@ -9980,6 +10314,10 @@ def render_single(symbol, interval, show_alerts, max_bars=90,
         st.markdown("---")
         render_mtf_keylevel_analysis(symbol, current_price=last)
 
+    # ── 🧠 AI 全面總結（放最後，確保所有分析結果都已產生）──────────────────
+    if show_summary:
+        render_master_summary_panel(symbol, prepost=_prepost)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Sidebar
 # ══════════════════════════════════════════════════════════════════════════════
@@ -10079,6 +10417,7 @@ with st.sidebar:
     show_options = st.toggle("📊 期權數據面板 (P/C Ratio / IV / 流向)", value=True)
     show_mtf_keylevels = st.toggle("🗺️ 多框架關鍵位分析 (月/週/日)", value=True)
     show_briefing = st.toggle("📋 今日操作簡報（全股票一覽）", value=True)
+    show_summary  = st.toggle("🧠 AI 全面總結（自動彙整所有分析）", value=True)
 
     st.markdown("---")
     st.markdown("**🌙 延長時段**")
@@ -10135,7 +10474,8 @@ for tab, symbol in zip(stock_tabs, symbols):
             render_single(symbol, single_interval, show_alerts, max_bars=max_bars,
                           show_pre=show_pre, show_post=show_post, show_night=show_night,
                           show_ai=show_ai, show_market=show_market, show_social=show_social,
-                          show_options=show_options, show_mtf_keylevels=show_mtf_keylevels)
+                          show_options=show_options, show_mtf_keylevels=show_mtf_keylevels,
+                          show_summary=show_summary)
 
         else:
             if not selected:
@@ -10147,6 +10487,8 @@ for tab, symbol in zip(stock_tabs, symbols):
                 st.markdown("---")
                 # ② 多週期 K 線圖
                 render_mtf_charts(symbol, selected, layout_mode, max_bars=max_bars, prepost=_mtf_prepost)
+                if show_summary:
+                    render_master_summary_panel(symbol, prepost=_mtf_prepost)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ⏱️ 進場時機追蹤面板
