@@ -10319,6 +10319,315 @@ def call_groq_compare(prompt: str) -> dict:
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+# ── FULL-PROMPT-START ─────────────────────────────────────────────────────────
+# 📦 完整版 Prompt：全部股票・全部詳細資訊，貼到 Claude / ChatGPT 自行分析
+_FULL_PRESETS = {
+    "日K 主框（15分 / 日K / 週K 共振）":      ("1d",  ["15m", "1d", "1wk"]),
+    "週K 主框（日K / 週K / 月K 共振）":       ("1wk", ["1d", "1wk", "1mo"]),
+    "短線 15分 主框（5分 / 15分 / 30分 共振）": ("15m", ["5m", "15m", "30m"]),
+}
+
+
+def _fmt_vol(v) -> str:
+    v = float(v)
+    for u, d in (("B", 1e9), ("M", 1e6), ("K", 1e3)):
+        if abs(v) >= d:
+            return f"{v / d:.2f}{u}"
+    return f"{v:.0f}"
+
+
+def _fpx(x) -> str:
+    x = float(x)
+    return f"{x:.2f}" if abs(x) >= 1 else f"{x:.4f}"
+
+
+def _macd_state(h, hp, dif, scale) -> str:
+    if hp <= 0 < h:
+        return "Histogram翻正"
+    if hp >= 0 > h:
+        return "Histogram翻負"
+    if h > 0:
+        if h >= hp:
+            return "強勢多頭" if dif > 0 else "多頭加速"
+        return "多頭動能減弱"
+    if h < hp:
+        return "空頭動能強"
+    return "接近反轉" if abs(h) < 0.1 * scale else "跌勢放緩"
+
+
+def _trend_label(dif, hist) -> str:
+    if dif > 0 and hist > 0:
+        return "強勢多頭"
+    if dif <= 0 and hist > 0:
+        return "多頭趨勢"
+    if dif > 0 and hist <= 0:
+        return "震盪觀望"
+    return "空頭趨勢"
+
+
+def _vp_state(vr, ret) -> str:
+    if vr >= 2:
+        return "爆量上漲" if ret > 0 else "爆量下跌"
+    if vr >= 1.3:
+        return "放量上漲" if ret > 0 else "放量下跌"
+    if vr <= 0.7:
+        if ret > 0:
+            return "縮量上漲(動能存疑)"
+        if ret < 0:
+            return "縮量下跌(賣壓減輕)"
+    return "量能正常"
+
+
+def _cluster(prices, tol=0.006):
+    out = []
+    for p in sorted(prices):
+        if out and abs(p - out[-1]["m"]) / out[-1]["m"] <= tol:
+            g = out[-1]; g["n"] += 1; g["s"] += p; g["m"] = g["s"] / g["n"]
+        else:
+            out.append({"m": p, "n": 1, "s": p})
+    return [(round(g["m"], 2), g["n"]) for g in out]
+
+
+def _full_snap(df, interval: str):
+    """單一股票・單一週期的完整快照（MACD / 量價 / OBV / 支撐阻力 / 樞軸 / D+1~3 / 近5根）"""
+    if df is None or len(df) < 40:
+        return None
+    c = df["Close"].astype(float); v = df["Volume"].astype(float)
+    dif, dea, hist = calc_macd(c)
+    atr = calc_atr(df)
+    vr = v / v.shift(1).rolling(20).mean()
+    ret = c.pct_change() * 100
+    obv = (np.sign(c.diff()).fillna(0) * v).cumsum()
+    obv_in = bool(obv.iloc[-1] > obv.rolling(20).mean().iloc[-1])
+    scale = hist.abs().rolling(10).max()
+    n = len(df)
+    last = float(c.iloc[-1])
+
+    def state_at(i):
+        return _macd_state(float(hist.iloc[i]), float(hist.iloc[i - 1]),
+                           float(dif.iloc[i]), float(scale.iloc[i]) if scale.iloc[i] == scale.iloc[i] else 0.0)
+
+    # 支撐 / 阻力：擺動高低點聚類（括號為觸及次數）
+    hs, ls = calc_pivot(df, interval)
+    res = [(p, k) for p, k in _cluster([p for _, p in hs]) if p > last * 1.0005]
+    sup = [(p, k) for p, k in _cluster([p for _, p in ls]) if p < last * 0.9995]
+    res.sort(key=lambda x: x[0]); sup.sort(key=lambda x: -x[0])
+    nr = res[0][0] if res else None
+    ns_ = sup[0][0] if sup else None
+    dr = (nr / last - 1) * 100 if nr else None
+    ds = (ns_ / last - 1) * 100 if ns_ else None
+    near = [(abs(d), t) for d, t in ((dr, "阻力"), (ds, "支撐")) if d is not None and abs(d) <= 4.0]
+    pos = f"靠近{min(near)[1]}" if near else "區間中段"
+
+    # 經典樞軸（前一根已收盤 K 線）
+    pv = None
+    if n >= 3:
+        H, Lw, C = (float(df["High"].iloc[-2]), float(df["Low"].iloc[-2]), float(c.iloc[-2]))
+        P = (H + Lw + C) / 3
+        pv = (P + (H - Lw), 2 * P - Lw, P, 2 * P - H, P - (H - Lw))
+
+    # D+1~D+3：Histogram 最近 3 根平均斜率，每步衰減 30% 外推（動能，非價格）
+    slope = float((hist.iloc[-1] - hist.iloc[-4]) / 3)
+    d_pred, h_cur = [], float(hist.iloc[-1])
+    for k in range(3):
+        h_cur += slope * (0.7 ** k)
+        d_pred.append(h_cur)
+
+    fmt = "%m/%d %H:%M" if interval.endswith("m") else "%m/%d"
+    last5 = []
+    for i in range(n - 5, n):
+        try:
+            ds_str = df.index[i].strftime(fmt)
+        except Exception:
+            ds_str = str(df.index[i])[:10]
+        last5.append((ds_str, float(c.iloc[i]), float(v.iloc[i]),
+                      float(vr.iloc[i]) if vr.iloc[i] == vr.iloc[i] else 0.0,
+                      float(dif.iloc[i]), float(hist.iloc[i]), state_at(i)))
+
+    vr_now = float(vr.iloc[-1]) if vr.iloc[-1] == vr.iloc[-1] else 1.0
+    return {
+        "last": last, "chg": float(ret.iloc[-1]), "dif": float(dif.iloc[-1]), "hist": float(hist.iloc[-1]),
+        "state": state_at(n - 1), "trend": _trend_label(float(dif.iloc[-1]), float(hist.iloc[-1])),
+        "atr": float(atr.iloc[-1]), "vr": vr_now, "vp": _vp_state(vr_now, float(ret.iloc[-1])),
+        "obv": "OBV 資金流入" if obv_in else "OBV 資金流出",
+        "res": res, "sup": sup, "nr": nr, "ns": ns_, "dr": dr, "ds": ds, "pos": pos,
+        "pivot": pv, "d": d_pred, "last5": last5,
+    }
+
+
+def build_full_paste_prompt(symbols, main_iv: str, frames, prepost: bool = False, progress=None) -> str:
+    """全部股票・全部詳細資訊的完整 Prompt（章節結構同 MACD 監控匯出檔）"""
+    lab = lambda iv: INTERVAL_LABELS.get(iv, iv)
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    snaps = {}
+    for i, sym in enumerate(symbols):
+        if progress:
+            progress.progress((i + 1) / len(symbols), text=f"讀取 {sym}（{i+1}/{len(symbols)}）")
+        snaps[sym] = {}
+        for iv in dict.fromkeys(list(frames) + [main_iv]):
+            try:
+                snaps[sym][iv] = _full_snap(fetch_data(sym, iv, prepost=prepost), iv)
+            except Exception:
+                snaps[sym][iv] = None
+    ok = [s for s in symbols if snaps[s].get(main_iv)]
+    miss = [s for s in symbols if s not in ok]
+
+    L = [f"你是一位資深美股量化交易分析師。以下是我的 MACD 多股票監控系統在 {now_str} 產生的完整分析結果，"
+         f"共 {len(symbols)} 支候選股票，請據此比較並判斷哪一隻最值得買。\n"]
+
+    # ── 一、背景 ──
+    L.append("## 一、背景")
+    L.append(f"- 主時間框架：{lab(main_iv)}")
+    L.append(f"- 多時框共振：{'、'.join(lab(f) for f in frames)}")
+    L.append("- MACD 參數 (12, 26, 9)；ATR 週期 14")
+    L.append("- 量比 = 當根成交量 / 前 20 根平均成交量（≥1.3 放量，≥2 爆量，≤0.7 縮量）；OBV 以 20 根均線判斷資金流向")
+    L.append("- 支撐阻力 = 擺動高低點偵測後，相近價位（±0.6%）聚類（括號為觸及次數，越多越有效），另附前一根 K 線計算的經典樞軸點")
+    L.append("- D+1 / D+2 / D+3 是系統以最近 3 根 Histogram 平均斜率、每步衰減 30% 外推的動能預測值（不是價格預測）")
+    L.append("- 趨勢判定：DIF>0 且 Hist>0＝強勢多頭；DIF≤0 且 Hist>0＝多頭趨勢；DIF>0 且 Hist≤0＝震盪觀望；DIF≤0 且 Hist≤0＝空頭趨勢")
+    L.append("- 注意：最後一根 K 線若尚未收盤，成交量不完整，量比可能被低估")
+    try:
+        mkt = fetch_market_data()
+        sent = calc_sentiment_score(mkt, fetch_vix_history())
+        L.append(f"- 大盤環境：情緒分數 {sent['score']}/100（{sent['label']}）｜" +
+                 "｜".join(f"{m['name']} {m['pct']:+.2f}%" for m in mkt.values()))
+    except Exception:
+        pass
+    if miss:
+        L.append(f"- 數據未載入（已略過）：{'、'.join(miss)}")
+    L.append("")
+
+    # ── 二、總覽 ──
+    L.append("## 二、總覽")
+    L.append("| 代碼 | 收盤 | 漲跌% | MACD | Histogram | 狀態 | 趨勢 | ATR | 量比 | 量價狀態 | OBV | 最近阻力 | 最近支撐 | D+1 | D+2 | D+3 |")
+    L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    for s in ok:
+        m = snaps[s][main_iv]
+        r_ = f"{_fpx(m['nr'])} ({m['dr']:+.1f}%)" if m["nr"] else "—"
+        s_ = f"{_fpx(m['ns'])} ({m['ds']:+.1f}%)" if m["ns"] else "—"
+        L.append(f"| {s} | {_fpx(m['last'])} | {m['chg']:+.2f}% | {m['dif']:+.3f} | {m['hist']:+.3f} | {m['state']} | "
+                 f"{m['trend']} | {m['atr']:.3f} | {m['vr']:.2f}x | {m['vp']} | {m['obv']} | {r_} | {s_} | "
+                 f"{m['d'][0]:+.3f} | {m['d'][1]:+.3f} | {m['d'][2]:+.3f} |")
+    L.append("")
+
+    # ── 三、支撐 / 阻力明細 ──
+    L.append("## 三、支撐 / 阻力明細")
+    L.append("| 代碼 | 目前位置 | 阻力（近→遠，括號為觸及次數） | 支撐（近→遠） | 樞軸點 R2 / R1 / P / S1 / S2 |")
+    L.append("|---|---|---|---|---|")
+    for s in ok:
+        m = snaps[s][main_iv]
+        rs = "、".join(f"{_fpx(p)}({k})" for p, k in m["res"][:3]) or "—"
+        ss = "、".join(f"{_fpx(p)}({k})" for p, k in m["sup"][:3]) or "—"
+        pv = " / ".join(_fpx(x) for x in m["pivot"]) if m["pivot"] else "—"
+        L.append(f"| {s} | {m['pos']} | {rs} | {ss} | {pv} |")
+    L.append("")
+
+    # ── 四、多時框共振 ──
+    L.append("## 四、多時框共振")
+    L.append("| 代碼 | " + " | ".join(f"{lab(f)} 趨勢 (Hist / ATR / 量比)" for f in frames) + " | 共振判斷 |")
+    L.append("|---|" + "---|" * (len(frames) + 1))
+    for s in ok:
+        cells, bull, tot = [], 0, 0
+        for f in frames:
+            m = snaps[s].get(f)
+            if not m:
+                cells.append("無數據"); continue
+            tot += 1
+            bull += m["trend"] in ("強勢多頭", "多頭趨勢")
+            cells.append(f"{m['trend']} ({m['hist']:+.3f} / {m['atr']:.3f} / {m['vr']:.2f}x)")
+        if tot and bull == tot:
+            verdict = "全部看多（共振）"
+        elif tot and bull == 0:
+            verdict = "全部看空（共振）"
+        else:
+            verdict = f"分歧（多 {bull} / 空 {tot - bull}）"
+        L.append(f"| {s} | " + " | ".join(cells) + f" | {verdict} |")
+    L.append("")
+
+    # ── 五、期權・社群・月週日關鍵位（本系統獨有資料）──
+    L.append("## 五、期權 / 社群情緒 / 月週日關鍵位")
+    L.append("| 代碼 | P/C量 | P/C OI | ATM IV | 最大痛點 | 期權訊號 | 新聞+StockTwits偏多 | Reddit偏多 | 月K | 週K | 日K | 週K最近阻力 / 支撐 |")
+    L.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
+    for s in ok:
+        try:
+            op = fetch_options_data(s)
+            if op.get("error"):
+                raise ValueError
+            pcv = f"{op['pc_vol']:.2f}" if op.get("pc_vol") is not None else "—"
+            pco = f"{op['pc_oi']:.2f}" if op.get("pc_oi") is not None else "—"
+            iv = f"{op['atm_iv']:.1f}%" if op.get("atm_iv") is not None else "—"
+            mp = f"{op['max_pain']:.0f}" if op.get("max_pain") else "—"
+            sg = op.get("signal", "neutral")
+        except Exception:
+            pcv = pco = iv = mp = sg = "—"
+        try:
+            sd = fetch_stocktwits(s); st_ = f"{sd['bull_pct']}%（{sd['total']}）"
+        except Exception:
+            st_ = "—"
+        try:
+            rd = fetch_reddit_sentiment(s); rd_ = f"{rd['bull_pct']}%（{rd['total']}）"
+        except Exception:
+            rd_ = "—"
+        dirs = {"月K": "—", "週K": "—", "日K": "—"}; wk = "—"
+        try:
+            kl = fetch_mtf_keylevels(s)
+            for fname, f in (kl.get("frames") or {}).items():
+                if f and "error" not in f:
+                    dirs[fname] = f["dir_label"]
+                    if fname == "週K":
+                        wk = f"{f['nearest_res']} ({f['dist_res_pct']}%) / {f['nearest_sup']} (-{f['dist_sup_pct']}%)"
+        except Exception:
+            pass
+        L.append(f"| {s} | {pcv} | {pco} | {iv} | {mp} | {sg} | {st_} | {rd_} | {dirs['月K']} | {dirs['週K']} | {dirs['日K']} | {wk} |")
+    L.append("")
+
+    # ── 六、各股近 5 根 K 線明細 ──
+    L.append(f"## 六、各股近 5 根 K 線明細")
+    for s in ok:
+        m = snaps[s][main_iv]
+        L.append(f"### {s}（{lab(main_iv)}）")
+        L.append("| 日期 | 收盤 | 成交量 | 量比 | MACD | Histogram | 狀態 |")
+        L.append("|---|---|---|---|---|---|---|")
+        for d, cl, vo, vr_, df_, hi, stt in m["last5"]:
+            L.append(f"| {d} | {_fpx(cl)} | {_fmt_vol(vo)} | {vr_:.2f}x | {df_:+.3f} | {hi:+.3f} | {stt} |")
+        L.append("")
+
+    # ── 七、警示 / 既有 AI 信號 / 建議交易（僅在有資料時列出）──
+    ext = []
+    for s in ok:
+        rows = []
+        for a in [a for a in st.session_state.get("alert_log", []) if a.get("股票") == s][:5]:
+            rows.append(f"警示 {a['時間']} [{a['週期']}] {a['類型']}：{_sum_clean(a['訊息'])}")
+        for k, v in st.session_state.items():
+            if isinstance(k, str) and k.startswith(f"ai_manual_{s}_") and isinstance(v, dict) and "error" not in v:
+                rows.append(f"AI信號 [{v.get('_period','')}] {v.get('verdict','觀望')}（信心 {v.get('confidence','—')}%）"
+                            f"進場 ${v.get('entry_price',0)}／止損 ${v.get('stop_loss',0)}／止盈 ${v.get('take_profit_1',0)}")
+        for t in [t for t in st.session_state.get("trade_suggestions", []) if t.get("股票") == s and t.get("狀態") == "待確認"][:2]:
+            rows.append(f"系統建議 {t['方向']} [{t['週期']}] 進場 ${t['進場']:.2f}／止損 ${t['止損']:.2f}／止盈 ${t['止盈1']:.2f}／回測勝率 {t['WR']:.0f}%")
+        if rows:
+            ext.append(f"### {s}\n" + "\n".join(f"- {r}" for r in rows))
+    if ext:
+        L.append("## 七、警示 / 既有 AI 信號 / 系統建議交易")
+        L.extend(ext)
+        L.append("")
+
+    # ── 輸出要求 ──
+    n = len(ok)
+    L.append("\n## 八、請你輸出（繁體中文，結構化表格為主，結論要明確，不要模稜兩可）")
+    L.append(f"""1. **最終結論**：從上面全部 {n} 支股票中，一句話指出「現在最值得買的是哪一隻」並給信心度 0-100%；若沒有任何一隻有足夠優勢，直接說「全部都不建議現在買入」，不可為了選而選。
+2. **市場整體判斷**：一句話說明整體偏多、偏空或分歧，並列出多頭與空頭股票各有哪些。
+3. **強弱排名表**（全部 {n} 支）：排名 | 代碼 | 方向（做多/做空/觀望） | 信心度（高/中/低） | 一句話理由。信心度請同時考慮 MACD 動能、量能是否確認、期權與社群是否同向。
+4. **量價訊號表**：標出「放量突破 / 放量跌破 / 量價背離（縮量上漲）」的股票，說明該訊號可信或不可信的原因。
+5. **交易計劃表**（排名前 5 的股票）：方向 | 參考入場價 | 止損價 | 目標價 | 風險回報比。止損優先放在最近支撐下方（約 0.5 ATR 緩衝），目標優先取最近阻力與下一個阻力；若價位不合理，再以 ATR 倍數換算，並寫出依據。
+6. **多時框矛盾警示**：找出短線與長線方向相反的股票，說明該聽哪個時間框架。
+7. **最值得優先買的前 3 檔**與建議資金分配（百分比、單筆最大虧損上限），以及明確要避開的股票（例如緊貼阻力、風險回報比差、槓桿 ETF 耗損者）。
+8. **風險提示**：列出會讓上述判斷失效的具體條件（例如 Histogram 翻負、放量跌破某支撐價位）。
+
+限制：只能根據上面的數據推論，不得編造未提供的新聞或財報；數據不足時請明確說明。本內容僅為技術分析參考，不構成投資建議。""")
+    return "\n".join(L)
+# ── FULL-PROMPT-END ───────────────────────────────────────────────────────────
+
+
+
 def render_compare_panel(symbols, prepost: bool = False):
     """🏆 多股票比較面板：全部股票評分排名 → AI 深入比較前 N 支，找出最值得買的一隻"""
     symbols = list(dict.fromkeys(symbols))
@@ -10407,9 +10716,34 @@ def render_compare_panel(symbols, prepost: bool = False):
         st.markdown(st.session_state[k_txt])
         st.caption("⚠️ AI 自動生成，僅供技術參考，不構成投資建議")
 
-    with st.expander("📋 完整比較 Prompt（可複製到其他 AI）", expanded=False):
+    # ══ 📦 完整版 Prompt：全部股票・全部詳細資訊，貼到其他 AI 自行分析 ══════════════
+    st.markdown("##### 📦 完整數據 Prompt（全部股票・全部詳細資訊，貼到 Claude / ChatGPT 自行分析）")
+    fc1, fc2 = st.columns([4, 1])
+    with fc1:
+        preset = st.selectbox("主時間框架 / 共振組合", list(_FULL_PRESETS.keys()), index=0, key=f"{key}_preset")
+    with fc2:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        f_force = st.button("🔄 重新生成", key=f"{key}_fbtn", use_container_width=True)
+    fkey = f"{key}_full_{preset}"
+    bucket = int(time.time() // 180)          # 3 分鐘內重用，避免 60 秒自動刷新反覆重算
+    if f_force or fkey not in st.session_state or st.session_state.get(fkey + "_b") != bucket:
+        fprog = st.progress(0.0, text="彙整完整數據中...")
+        main_iv, frames = _FULL_PRESETS[preset]
+        st.session_state[fkey] = build_full_paste_prompt(symbols, main_iv, frames, prepost=prepost, progress=fprog)
+        st.session_state[fkey + "_b"] = bucket
+        fprog.empty()
+    full_text = st.session_state[fkey]
+    st.caption(f"共 {len(symbols)} 支股票、{len(full_text):,} 字元。Groq 免費額度放不下這麼長的內容，"
+               "請複製（程式碼框右上角）或下載後貼到 Claude / ChatGPT。")
+    st.download_button("📥 下載完整 Prompt (.txt)", full_text,
+                       file_name=f"compare_all_prompt_{datetime.now().strftime('%Y%m%d_%H%M')}.txt",
+                       key=f"{key}_fdl")
+    with st.expander("👁️ 預覽 / 複製完整 Prompt", expanded=False):
+        st.code(full_text, language="markdown")
+
+    with st.expander("📋 Groq 精簡版 Prompt（僅前 N 支，上方自動比較用的）", expanded=False):
         st.code(prompt, language="markdown")
-        st.download_button("📥 下載 Prompt (.txt)", prompt, file_name="compare_stocks_prompt.txt",
+        st.download_button("📥 下載精簡版 (.txt)", prompt, file_name="compare_stocks_groq_prompt.txt",
                            key=f"{key}_dl")
 
 
