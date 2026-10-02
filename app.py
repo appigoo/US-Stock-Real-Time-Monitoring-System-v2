@@ -9891,14 +9891,16 @@ def _sum_tech_snapshot(symbol: str, interval: str, prepost: bool = False) -> dic
         return {}
 
 
-def build_master_summary_prompt(symbol: str, frames=None, prepost: bool = False):
+def build_master_summary_prompt(symbol: str, frames=None, prepost: bool = False,
+                                include_task: bool = True, compact: bool = False):
     """
     把所有分析結果組成一份完整的「總結 Prompt」。
     回傳 (prompt 文字, fingerprint)；fingerprint 只含方向性結論，
     用來判斷「分析結論是否真的改變」，避免價格跳動就重複呼叫 AI。
     """
-    frames = frames or _SUMMARY_FRAMES
+    frames = frames or (["15m", "1d", "1wk"] if compact else _SUMMARY_FRAMES)
     fp = {}
+    meta = {}
     L = []
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     L.append(f"# {symbol} 全面分析數據包（生成時間 {now_str}）\n")
@@ -9930,6 +9932,8 @@ def build_master_summary_prompt(symbol: str, frames=None, prepost: bool = False)
         tech_cnt += 1
         if itv == "1d" or last_px is None:
             last_px = s["last"]
+            meta["last"] = s["last"]; meta["atr_pct"] = s["atr"] / s["last"] * 100 if s["last"] else 0
+            meta["ret5"] = s["ret5"]
         rsi = f"{s['rsi']:.0f}" if s["rsi"] is not None else "—"
         res = "/".join(f"${x}" for x in s["res"]) or "—"
         sup = "/".join(f"${x}" for x in s["sup"]) or "—"
@@ -9974,9 +9978,9 @@ def build_master_summary_prompt(symbol: str, frames=None, prepost: bool = False)
                 L.append(f"- 最大痛點 ${op['max_pain']:.0f}")
             L.append(f"- 權利金：Call ${op['tot_c_prem']/1e6:.1f}M / Put ${op['tot_p_prem']/1e6:.1f}M")
             L.append(f"- 期權綜合訊號：{op.get('signal', 'neutral')}")
-            for r in op.get("signal_reasons", [])[:4]:
+            for r in op.get("signal_reasons", [])[:(2 if compact else 4)]:
                 L.append(f"  - {r}")
-            for t in op.get("top_trades", [])[:3]:
+            for t in op.get("top_trades", [])[:(2 if compact else 3)]:
                 L.append(f"- 大額成交：{t['type']} ${t['strike']:.0f} 到期{t['expiry']}，"
                          f"權利金 ${t['premium']/1e6:.2f}M，量 {t['volume']}")
             fp["opt"] = op.get("signal", "neutral")
@@ -9991,7 +9995,7 @@ def build_master_summary_prompt(symbol: str, frames=None, prepost: bool = False)
         L.append("## 5. 社群 / 新聞情緒")
         L.append(f"- 新聞+StockTwits：偏多 {st_d['bull_pct']}%（樣本 {st_d['total']}）")
         L.append(f"- Reddit：偏多 {rd_d['bull_pct']}%（樣本 {rd_d['total']}）")
-        for m in st_d.get("messages", [])[:3]:
+        for m in st_d.get("messages", [])[:(1 if compact else 3)]:
             L.append(f"  - [{m.get('sentiment','')}] {_sum_clean(m.get('body',''), 90)}")
         fp["soc"] = (st_d["bull_pct"] // 20, rd_d["bull_pct"] // 20)
         L.append("")
@@ -10004,7 +10008,7 @@ def build_master_summary_prompt(symbol: str, frames=None, prepost: bool = False)
         nb = sum(1 for a in alerts if a["類型"] == "bull")
         ne = sum(1 for a in alerts if a["類型"] == "bear")
         L.append(f"## 6. 警示信號（累計 多頭 {nb} / 空頭 {ne} / 其他 {len(alerts)-nb-ne}）")
-        for a in alerts[:12]:
+        for a in alerts[:(5 if compact else 12)]:
             L.append(f"- {a['時間']} [{a['週期']}] {a['類型']}：{_sum_clean(a['訊息'])}")
         fp["alerts"] = len(alerts)
         L.append("")
@@ -10019,7 +10023,7 @@ def build_master_summary_prompt(symbol: str, frames=None, prepost: bool = False)
             ai_rows.append(v)
     if ai_rows:
         L.append("## 7. 各週期 AI 信號分析結果")
-        for v in ai_rows[:6]:
+        for v in ai_rows[:(3 if compact else 6)]:
             L.append(f"- [{v.get('_period','')}] {v.get('verdict','觀望')}（信心 {v.get('confidence','—')}%）"
                      f"｜進場 ${v.get('entry_price',0)}｜止盈 ${v.get('take_profit_1',0)}/${v.get('take_profit_2',0)}"
                      f"｜止損 ${v.get('stop_loss',0)}｜{_sum_clean(v.get('reasoning',''), 120)}")
@@ -10040,6 +10044,10 @@ def build_master_summary_prompt(symbol: str, frames=None, prepost: bool = False)
             L.append(f"- 追蹤中 {t['direction']}：來源「{t['trigger_signal']}」@ ${t['trigger_price']:.2f}｜"
                      f"止損 ${t['sl']}｜止盈 ${t['tp1']}/${t['tp2']}")
         L.append("")
+
+    st.session_state[f"sum_meta_{symbol}"] = meta
+    if not include_task:
+        return "\n".join(L), fp
 
     # ── 9. 給 AI 的任務指令 ───────────────────────────────────────────────
     ref = f"${last_px:.2f}" if last_px else "現價"
@@ -10166,6 +10174,201 @@ def render_master_summary_panel(symbol: str, prepost: bool = False):
                            file_name=f"{symbol}_summary_prompt.txt",
                            key=f"sum_dl_{symbol}")
 
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 🏆 多股票比較：彙整所有股票分析結果 → 比較 → AI 判斷最值得買的一隻
+# ══════════════════════════════════════════════════════════════════════════════
+def _vote_score(fp: dict) -> dict:
+    """把數據包的方向性結論換算成本地量化預評分（-100 ~ +100），供 AI 對照而非取代 AI。"""
+    parts = {}
+    w_tf = {"tech_5m": 0.5, "tech_15m": 0.75, "tech_30m": 1.0, "tech_1d": 2.0, "tech_1wk": 2.0}
+    s_tech = 0.0; w_sum = 0.0
+    for k, w in w_tf.items():
+        if k in fp:
+            trend, macd = fp[k]
+            v = (1 if trend == "多頭" else -1 if trend == "空頭" else 0) * 0.6 \
+                + (1 if macd == "多" else -1) * 0.4
+            s_tech += v * w; w_sum += w
+    parts["技術"] = (s_tech / w_sum) if w_sum else 0.0
+    kl = [fp[k] for k in fp if k.startswith("kl_")]
+    kmap = {"bull": 1, "neutral_bull": 0.5, "neutral": 0, "neutral_bear": -0.5, "bear": -1}
+    parts["關鍵位"] = (sum(kmap.get(x, 0) for x in kl) / len(kl)) if kl else 0.0
+    parts["期權"] = {"bull": 1, "bear": -1}.get(fp.get("opt"), 0) if "opt" in fp else 0.0
+    if "soc" in fp:
+        avg_pct = sum(b * 20 + 10 for b in fp["soc"]) / 2      # 區間中點還原成偏多%
+        parts["社群"] = max(-1.0, min(1.0, (avg_pct - 50) / 50))
+    else:
+        parts["社群"] = 0.0
+    weights = {"技術": 0.40, "關鍵位": 0.30, "期權": 0.20, "社群": 0.10}
+    total = sum(parts[k] * weights[k] for k in weights) * 100
+    return {"total": round(total), "parts": {k: round(v, 2) for k, v in parts.items()}}
+
+
+def build_compare_prompt(symbols, prepost: bool = False):
+    """彙整所有股票的分析結果，組成「哪一隻最值得買」的比較 Prompt。"""
+    L = []
+    fps = {}
+    scores = {}
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    L.append(f"# 多股票比較數據包（{now_str}）\n候選股票：{'、'.join(symbols)}\n")
+
+    try:
+        mkt = fetch_market_data()
+        sent = calc_sentiment_score(mkt, fetch_vix_history())
+        L.append(f"## 共用大盤環境\n- 情緒分數 {sent['score']}/100（{sent['label']}）｜" +
+                 "｜".join(f"{m['name']} {m['pct']:+.2f}%" for m in mkt.values()) + "\n")
+        fps["_mkt"] = sent["label"]
+    except Exception:
+        pass
+
+    for sym in symbols:
+        body, fp = build_master_summary_prompt(sym, prepost=prepost, include_task=False, compact=True)
+        body = re.sub(r"^# .*?\n", "", body, count=1)
+        body = re.sub(r"## 1\. 大盤環境.*?(?=## 2\.)", "", body, flags=re.S)
+        body = re.sub(r"^## ", "#### ", body, flags=re.M)
+        L.append(f"\n# ═══════ 【{sym}】 ═══════")
+        L.append(body.strip())
+        fps[sym] = fp
+        scores[sym] = _vote_score(fp)
+        meta = st.session_state.get(f"sum_meta_{sym}", {})
+        ps = scores[sym]["parts"]
+        L.append(f"\n#### 本地量化預評分（-100 空 ~ +100 多）：**{scores[sym]['total']:+d}**"
+                 f"｜技術 {ps['技術']:+.2f}｜關鍵位 {ps['關鍵位']:+.2f}｜期權 {ps['期權']:+.2f}｜社群 {ps['社群']:+.2f}"
+                 + (f"｜日ATR波幅 {meta['atr_pct']:.1f}%" if meta.get("atr_pct") else ""))
+
+    ranked = sorted(scores.items(), key=lambda x: -x[1]["total"])
+    L.append("\n---\n## 預評分排名（僅供參考，AI 須自行驗證）")
+    L.append("| 排名 | 股票 | 預評分 | 技術 | 關鍵位 | 期權 | 社群 |")
+    L.append("|---|---|---|---|---|---|---|")
+    for i, (sym, sc) in enumerate(ranked, 1):
+        p = sc["parts"]
+        L.append(f"| {i} | {sym} | {sc['total']:+d} | {p['技術']:+.2f} | {p['關鍵位']:+.2f} | {p['期權']:+.2f} | {p['社群']:+.2f} |")
+
+    L.append(f"""
+---
+# 任務
+你是資深美股交易分析師。以上是 {len(symbols)} 隻候選股票（{'、'.join(symbols)}）的完整分析數據。
+請**比較它們，判斷現在哪一隻最值得買**，使用繁體中文。
+
+## 輸出格式（嚴格遵守）
+1. **一句話結論**：「最值得買：XXX」或「全部都不建議現在買入」，並給信心度 0-100%。若沒有任何一隻有足夠優勢，必須直接說不買，不可為了選而選。
+2. **排名比較表**（Markdown 表格）：排名、股票、方向（做多/觀望/做空）、風險回報比、最大優勢、最大隱憂。
+3. **最佳標的操作計劃表**：進場區間、止損、止盈①、止盈②、盈虧比，全部用具體美元數字，價位只能來自數據中的支撐/壓力/ATR。
+4. **為什麼它贏過其他股票**：逐一說明，必須引用數據中的具體數字（如週K壓力距離、P/C、RSI、量比）。
+5. **建議資金分配**：給出百分比（例如 70% / 30% / 0%），並說明單筆最大虧損應限制在總資金多少%。
+6. **失效條件**：什麼價位或事件出現就代表判斷錯誤，要放棄或反向。
+7. **短線 vs 波段**：若短線與波段的最佳標的不同，分別指出。
+
+## 規則
+- 只使用上方數據，缺失就寫「無數據」，不要編造數字。
+- 預評分只是機械式投票，若你的判斷與它不同，要明確說明原因。
+- 結論要果斷，不確定就降低信心度，而不是用含糊措辭。
+- 比較時留意是否有股票處於壓力位正下方、RSI 過熱、或週K與日K方向衝突。
+- 總字數 600 字以內（表格不計）。僅為技術分析參考，不構成投資建議。""")
+    return "\n".join(L), fps, scores
+
+
+def call_groq_compare(prompt: str) -> dict:
+    """比較用呼叫：更大的輸出空間，並處理 token 超限。"""
+    api_key = get_groq_key()
+    if not api_key:
+        return {"error": "NO_KEY"}
+    try:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": "llama-3.3-70b-versatile",
+                  "messages": [
+                      {"role": "system",
+                       "content": "你是專業美股交易分析師。永遠使用繁體中文，結論果斷、數字具體，"
+                                  "只引用使用者提供的數據，沒有明顯優勢時直接建議不買。輸出 Markdown。"},
+                      {"role": "user", "content": prompt}],
+                  "max_tokens": 2200, "temperature": 0.25},
+            timeout=60)
+        if resp.status_code == 401:
+            return {"error": "Groq API Key 無效，請重新輸入"}
+        if resp.status_code in (413, 400) and "token" in resp.text.lower():
+            return {"error": "數據包超過 Groq 單次 token 上限，請減少股票數量後重試"}
+        if resp.status_code == 429:
+            return {"error": "請求頻率或 token 額度限制，請稍後再試"}
+        if resp.status_code != 200:
+            return {"error": f"Groq 錯誤 {resp.status_code}: {resp.text[:150]}"}
+        return {"text": resp.json()["choices"][0]["message"]["content"].strip()}
+    except requests.exceptions.Timeout:
+        return {"error": "請求超時（60秒），請稍後再試"}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def render_compare_panel(symbols, prepost: bool = False):
+    """🏆 多股票比較面板：自動比較所有股票，找出最值得買的一隻"""
+    symbols = list(dict.fromkeys(symbols))[:5]
+    if len(symbols) < 2:
+        return
+    st.markdown("---")
+    st.markdown(
+        '<div style="font-size:1.25rem;font-weight:900;color:#ffd166;margin:4px 0 8px 0;">'
+        f'🏆 AI 多股比較：{" vs ".join(symbols)} — 哪一隻最值得買？</div>',
+        unsafe_allow_html=True)
+
+    key = "cmp_" + "_".join(symbols)
+    k_txt, k_ts, k_fp, k_err = f"{key}_text", f"{key}_ts", f"{key}_fp", f"{key}_err"
+    has_key = bool(get_groq_key())
+
+    c1, c2, c3 = st.columns([2, 2, 1])
+    with c1:
+        auto_on = st.toggle("結論改變時自動比較", value=has_key, key=f"{key}_auto", disabled=not has_key)
+    with c2:
+        cooldown = st.slider("最短間隔（分鐘）", 2, 60, 10, key=f"{key}_cd",
+                             disabled=not (has_key and auto_on))
+    with c3:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        force = st.button("🔄 立即比較", key=f"{key}_btn", use_container_width=True)
+
+    with st.spinner("彙整所有股票分析結果中..."):
+        prompt, fps, scores = build_compare_prompt(symbols, prepost=prepost)
+
+    ranked = sorted(scores.items(), key=lambda x: -x[1]["total"])
+    cols = st.columns(len(ranked))
+    medals = ["🥇", "🥈", "🥉"]
+    for i, (col, (sym, sc)) in enumerate(zip(cols, ranked)):
+        col.metric(f"{medals[i] if i < 3 else '▫️'} {sym}", f"{sc['total']:+d}",
+                   f"技術{sc['parts']['技術']:+.1f} 關鍵位{sc['parts']['關鍵位']:+.1f}",
+                   delta_color="off")
+    st.caption("↑ 本地量化預評分（技術40% / 關鍵位30% / 期權20% / 社群10%），僅作對照；最終判斷以下方 AI 比較為準")
+
+    now = time.time()
+    fp_changed = st.session_state.get(k_fp) != fps
+    due = (now - st.session_state.get(k_ts, 0)) >= cooldown * 60
+    need_run = has_key and (force or k_txt not in st.session_state or (auto_on and fp_changed and due))
+    if need_run:
+        with st.spinner("🤖 AI 比較所有股票中..."):
+            res = call_groq_compare(prompt)
+        st.session_state[k_ts] = now
+        if "text" in res:
+            st.session_state[k_txt] = res["text"]
+            st.session_state[k_fp] = fps
+            st.session_state.pop(k_err, None)
+        else:
+            st.session_state[k_err] = res["error"]
+
+    if not has_key:
+        st.info("尚未設定 Groq API Key，無法自動比較。可展開下方複製完整 Prompt，貼到 Claude / ChatGPT / Gemini 使用。")
+    err = st.session_state.get(k_err)
+    if err and err != "NO_KEY":
+        st.warning(f"⚠️ {err}")
+    if k_txt in st.session_state:
+        ts = datetime.fromtimestamp(st.session_state[k_ts]).strftime("%H:%M:%S")
+        st.markdown(f'<div style="font-size:0.72rem;color:#556688;">最後比較：{ts}（Groq · LLaMA 3.3 70B）</div>',
+                    unsafe_allow_html=True)
+        st.markdown(st.session_state[k_txt])
+        st.caption("⚠️ AI 自動生成，僅供技術參考，不構成投資建議")
+
+    with st.expander("📋 完整比較 Prompt（可複製到其他 AI）", expanded=False):
+        st.code(prompt, language="markdown")
+        st.download_button("📥 下載 Prompt (.txt)", prompt, file_name="compare_stocks_prompt.txt",
+                           key=f"{key}_dl")
 
 
 def render_single(symbol, interval, show_alerts, max_bars=90,
@@ -10418,6 +10621,7 @@ with st.sidebar:
     show_mtf_keylevels = st.toggle("🗺️ 多框架關鍵位分析 (月/週/日)", value=True)
     show_briefing = st.toggle("📋 今日操作簡報（全股票一覽）", value=True)
     show_summary  = st.toggle("🧠 AI 全面總結（自動彙整所有分析）", value=True)
+    show_compare  = st.toggle("🏆 AI 多股比較（哪一隻最值得買）", value=True)
 
     st.markdown("---")
     st.markdown("**🌙 延長時段**")
@@ -10493,6 +10697,9 @@ for tab, symbol in zip(stock_tabs, symbols):
 # ══════════════════════════════════════════════════════════════════════════════
 # ⏱️ 進場時機追蹤面板
 # ══════════════════════════════════════════════════════════════════════════════
+if show_compare and len(symbols) >= 2:
+    render_compare_panel(symbols, prepost=(show_pre or show_post or show_night))
+
 render_entry_tracker_panel()
 
 # ══════════════════════════════════════════════════════════════════════════════
