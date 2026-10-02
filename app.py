@@ -10205,68 +10205,86 @@ def _vote_score(fp: dict) -> dict:
     return {"total": round(total), "parts": {k: round(v, 2) for k, v in parts.items()}}
 
 
-def build_compare_prompt(symbols, prepost: bool = False):
-    """彙整所有股票的分析結果，組成「哪一隻最值得買」的比較 Prompt。"""
-    L = []
-    fps = {}
-    scores = {}
+def build_compare_prompt(symbols, prepost: bool = False, top_k: int = 5, progress=None):
+    """
+    彙整「全部」股票的分析結果：
+      ① 對每一隻都算本地預評分 → 產生完整排名表（N 支都在）
+      ② 只把預評分最高的 top_k 支的完整數據包交給 AI 深入比較（控制 token）
+    回傳 (prompt, fp(只含入選股票), scores(全部), metas(全部), shortlist)
+    """
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    L.append(f"# 多股票比較數據包（{now_str}）\n候選股票：{'、'.join(symbols)}\n")
+    bodies, fps_all, scores, metas = {}, {}, {}, {}
+    for i, sym in enumerate(symbols):
+        if progress:
+            progress.progress((i + 1) / len(symbols), text=f"彙整 {sym}（{i+1}/{len(symbols)}）")
+        try:
+            body, fp = build_master_summary_prompt(sym, prepost=prepost, include_task=False, compact=True)
+        except Exception:
+            body, fp = "", {}
+        bodies[sym], fps_all[sym] = body, fp
+        scores[sym] = _vote_score(fp)
+        metas[sym] = st.session_state.get(f"sum_meta_{sym}", {})
 
+    ranked = sorted(scores.items(), key=lambda x: -x[1]["total"])
+    top_k = max(2, min(top_k, len(symbols)))
+    shortlist = [s for s, _ in ranked[:top_k]]
+
+    L = [f"# 多股票比較數據包（{now_str}）",
+         f"候選池共 {len(symbols)} 支：{'、'.join(symbols)}",
+         f"以下先列全部股票的完整排名，再附上預評分最高的 {top_k} 支（{'、'.join(shortlist)}）的詳細數據。\n"]
     try:
         mkt = fetch_market_data()
         sent = calc_sentiment_score(mkt, fetch_vix_history())
         L.append(f"## 共用大盤環境\n- 情緒分數 {sent['score']}/100（{sent['label']}）｜" +
                  "｜".join(f"{m['name']} {m['pct']:+.2f}%" for m in mkt.values()) + "\n")
-        fps["_mkt"] = sent["label"]
     except Exception:
         pass
 
-    for sym in symbols:
-        body, fp = build_master_summary_prompt(sym, prepost=prepost, include_task=False, compact=True)
+    L.append(f"## 全部 {len(symbols)} 支股票預評分排名（-100 空 ~ +100 多，僅供參考）")
+    L.append("| 排名 | 股票 | 預評分 | 技術 | 關鍵位 | 期權 | 社群 | 現價 | 日ATR% | 近5根 | 入選詳細分析 |")
+    L.append("|---|---|---|---|---|---|---|---|---|---|---|")
+    for i, (sym, sc) in enumerate(ranked, 1):
+        p, m = sc["parts"], metas.get(sym, {})
+        L.append(f"| {i} | {sym} | {sc['total']:+d} | {p['技術']:+.2f} | {p['關鍵位']:+.2f} | {p['期權']:+.2f} | {p['社群']:+.2f} | "
+                 f"{('$%.2f' % m['last']) if m.get('last') else '—'} | "
+                 f"{('%.1f%%' % m['atr_pct']) if m.get('atr_pct') else '—'} | "
+                 f"{('%+.2f%%' % m['ret5']) if m.get('ret5') is not None else '—'} | {'✅' if sym in shortlist else ''} |")
+    L.append("")
+
+    for sym in shortlist:
+        body = bodies[sym]
         body = re.sub(r"^# .*?\n", "", body, count=1)
         body = re.sub(r"## 1\. 大盤環境.*?(?=## 2\.)", "", body, flags=re.S)
         body = re.sub(r"^## ", "#### ", body, flags=re.M)
-        L.append(f"\n# ═══════ 【{sym}】 ═══════")
+        L.append(f"\n# ═══════ 【{sym}】 預評分 {scores[sym]['total']:+d} ═══════")
         L.append(body.strip())
-        fps[sym] = fp
-        scores[sym] = _vote_score(fp)
-        meta = st.session_state.get(f"sum_meta_{sym}", {})
-        ps = scores[sym]["parts"]
-        L.append(f"\n#### 本地量化預評分（-100 空 ~ +100 多）：**{scores[sym]['total']:+d}**"
-                 f"｜技術 {ps['技術']:+.2f}｜關鍵位 {ps['關鍵位']:+.2f}｜期權 {ps['期權']:+.2f}｜社群 {ps['社群']:+.2f}"
-                 + (f"｜日ATR波幅 {meta['atr_pct']:.1f}%" if meta.get("atr_pct") else ""))
-
-    ranked = sorted(scores.items(), key=lambda x: -x[1]["total"])
-    L.append("\n---\n## 預評分排名（僅供參考，AI 須自行驗證）")
-    L.append("| 排名 | 股票 | 預評分 | 技術 | 關鍵位 | 期權 | 社群 |")
-    L.append("|---|---|---|---|---|---|---|")
-    for i, (sym, sc) in enumerate(ranked, 1):
-        p = sc["parts"]
-        L.append(f"| {i} | {sym} | {sc['total']:+d} | {p['技術']:+.2f} | {p['關鍵位']:+.2f} | {p['期權']:+.2f} | {p['社群']:+.2f} |")
 
     L.append(f"""
 ---
 # 任務
-你是資深美股交易分析師。以上是 {len(symbols)} 隻候選股票（{'、'.join(symbols)}）的完整分析數據。
+你是資深美股交易分析師。候選池共 {len(symbols)} 支股票，上方有全部的預評分排名，並附上前 {top_k} 支（{'、'.join(shortlist)}）的詳細數據。
 請**比較它們，判斷現在哪一隻最值得買**，使用繁體中文。
 
 ## 輸出格式（嚴格遵守）
 1. **一句話結論**：「最值得買：XXX」或「全部都不建議現在買入」，並給信心度 0-100%。若沒有任何一隻有足夠優勢，必須直接說不買，不可為了選而選。
-2. **排名比較表**（Markdown 表格）：排名、股票、方向（做多/觀望/做空）、風險回報比、最大優勢、最大隱憂。
+2. **排名比較表**（Markdown 表格）：只列入選的 {top_k} 支——排名、股票、方向（做多/觀望/做空）、風險回報比、最大優勢、最大隱憂。
 3. **最佳標的操作計劃表**：進場區間、止損、止盈①、止盈②、盈虧比，全部用具體美元數字，價位只能來自數據中的支撐/壓力/ATR。
 4. **為什麼它贏過其他股票**：逐一說明，必須引用數據中的具體數字（如週K壓力距離、P/C、RSI、量比）。
 5. **建議資金分配**：給出百分比（例如 70% / 30% / 0%），並說明單筆最大虧損應限制在總資金多少%。
 6. **失效條件**：什麼價位或事件出現就代表判斷錯誤，要放棄或反向。
 7. **短線 vs 波段**：若短線與波段的最佳標的不同，分別指出。
+8. **被排除的股票**：若排名表中沒入選的股票裡有值得留意的（例如期權或社群異常強），用一句話點出。
 
 ## 規則
+- 詳細分析只涵蓋入選股票；沒入選的只有排名表上的摘要，不可編造它們的價位或細節。
 - 只使用上方數據，缺失就寫「無數據」，不要編造數字。
 - 預評分只是機械式投票，若你的判斷與它不同，要明確說明原因。
 - 結論要果斷，不確定就降低信心度，而不是用含糊措辭。
-- 比較時留意是否有股票處於壓力位正下方、RSI 過熱、或週K與日K方向衝突。
-- 總字數 600 字以內（表格不計）。僅為技術分析參考，不構成投資建議。""")
-    return "\n".join(L), fps, scores
+- 比較時留意是否有股票處於壓力位正下方、RSI 過熱、或週K與日K方向衝突；槓桿 ETF（如 TSLL）要考慮其波動與耗損。
+- 總字數 700 字以內（表格不計）。僅為技術分析參考，不構成投資建議。""")
+    fp_short = {s: fps_all[s] for s in shortlist}
+    fp_short["_order"] = tuple(shortlist)
+    return "\n".join(L), fp_short, scores, metas, shortlist
 
 
 def call_groq_compare(prompt: str) -> dict:
@@ -10302,21 +10320,29 @@ def call_groq_compare(prompt: str) -> dict:
 
 
 def render_compare_panel(symbols, prepost: bool = False):
-    """🏆 多股票比較面板：自動比較所有股票，找出最值得買的一隻"""
-    symbols = list(dict.fromkeys(symbols))[:5]
+    """🏆 多股票比較面板：全部股票評分排名 → AI 深入比較前 N 支，找出最值得買的一隻"""
+    symbols = list(dict.fromkeys(symbols))
     if len(symbols) < 2:
         return
-    st.markdown("---")
-    st.markdown(
-        '<div style="font-size:1.25rem;font-weight:900;color:#ffd166;margin:4px 0 8px 0;">'
-        f'🏆 AI 多股比較：{" vs ".join(symbols)} — 哪一隻最值得買？</div>',
-        unsafe_allow_html=True)
-
-    key = "cmp_" + "_".join(symbols)
+    import hashlib
+    key = "cmp_" + hashlib.md5(",".join(symbols).encode()).hexdigest()[:8]
     k_txt, k_ts, k_fp, k_err = f"{key}_text", f"{key}_ts", f"{key}_fp", f"{key}_err"
     has_key = bool(get_groq_key())
 
-    c1, c2, c3 = st.columns([2, 2, 1])
+    st.markdown("---")
+    st.markdown(
+        '<div style="font-size:1.25rem;font-weight:900;color:#ffd166;margin:4px 0 8px 0;">'
+        f'🏆 AI 多股比較：{len(symbols)} 支股票 — 哪一隻最值得買？</div>',
+        unsafe_allow_html=True)
+
+    max_k = min(len(symbols), 8)
+    c0, c1, c2, c3 = st.columns([2, 2, 2, 1])
+    with c0:
+        if max_k > 2:
+            top_k = st.slider("AI 深入比較前 N 支", 2, max_k, min(5, max_k), key=f"{key}_k",
+                              help="全部股票都會評分排名；只有預評分最高的 N 支會把完整數據交給 AI，以免超過 Groq token 上限")
+        else:
+            top_k = 2
     with c1:
         auto_on = st.toggle("結論改變時自動比較", value=has_key, key=f"{key}_auto", disabled=not has_key)
     with c2:
@@ -10326,24 +10352,38 @@ def render_compare_panel(symbols, prepost: bool = False):
         st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
         force = st.button("🔄 立即比較", key=f"{key}_btn", use_container_width=True)
 
-    with st.spinner("彙整所有股票分析結果中..."):
-        prompt, fps, scores = build_compare_prompt(symbols, prepost=prepost)
+    prog = st.progress(0.0, text="彙整所有股票分析結果中...")
+    prompt, fps, scores, metas, shortlist = build_compare_prompt(
+        symbols, prepost=prepost, top_k=top_k, progress=prog)
+    prog.empty()
 
+    # 全部股票的本地排名（不耗 AI 額度）
     ranked = sorted(scores.items(), key=lambda x: -x[1]["total"])
-    cols = st.columns(len(ranked))
     medals = ["🥇", "🥈", "🥉"]
-    for i, (col, (sym, sc)) in enumerate(zip(cols, ranked)):
+    cols = st.columns(min(len(ranked), 5))
+    for i, col in enumerate(cols):
+        sym, sc = ranked[i]
         col.metric(f"{medals[i] if i < 3 else '▫️'} {sym}", f"{sc['total']:+d}",
-                   f"技術{sc['parts']['技術']:+.1f} 關鍵位{sc['parts']['關鍵位']:+.1f}",
-                   delta_color="off")
-    st.caption("↑ 本地量化預評分（技術40% / 關鍵位30% / 期權20% / 社群10%），僅作對照；最終判斷以下方 AI 比較為準")
+                   f"技術{sc['parts']['技術']:+.1f} 關鍵位{sc['parts']['關鍵位']:+.1f}", delta_color="off")
+    with st.expander(f"📊 全部 {len(symbols)} 支股票預評分排名", expanded=len(symbols) > 5):
+        rows = []
+        for i, (sym, sc) in enumerate(ranked, 1):
+            p, m = sc["parts"], metas.get(sym, {})
+            rows.append({"排名": i, "股票": sym, "預評分": sc["total"],
+                         "技術": p["技術"], "關鍵位": p["關鍵位"], "期權": p["期權"], "社群": p["社群"],
+                         "現價": round(m["last"], 2) if m.get("last") else None,
+                         "日ATR%": round(m["atr_pct"], 1) if m.get("atr_pct") else None,
+                         "AI深入分析": "✅" if sym in shortlist else ""})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.caption(f"↑ 本地量化預評分（技術40% / 關鍵位30% / 期權20% / 社群10%），僅作對照。"
+               f"AI 深入比較：{'、'.join(shortlist)}")
 
     now = time.time()
     fp_changed = st.session_state.get(k_fp) != fps
     due = (now - st.session_state.get(k_ts, 0)) >= cooldown * 60
     need_run = has_key and (force or k_txt not in st.session_state or (auto_on and fp_changed and due))
     if need_run:
-        with st.spinner("🤖 AI 比較所有股票中..."):
+        with st.spinner("🤖 AI 比較中..."):
             res = call_groq_compare(prompt)
         st.session_state[k_ts] = now
         if "text" in res:
@@ -10358,6 +10398,8 @@ def render_compare_panel(symbols, prepost: bool = False):
     err = st.session_state.get(k_err)
     if err and err != "NO_KEY":
         st.warning(f"⚠️ {err}")
+        if "token" in err:
+            st.caption("💡 把「AI 深入比較前 N 支」調小，或把完整 Prompt 貼到 Claude / ChatGPT（上下文更大）")
     if k_txt in st.session_state:
         ts = datetime.fromtimestamp(st.session_state[k_ts]).strftime("%H:%M:%S")
         st.markdown(f'<div style="font-size:0.72rem;color:#556688;">最後比較：{ts}（Groq · LLaMA 3.3 70B）</div>',
